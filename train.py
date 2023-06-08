@@ -20,6 +20,8 @@ import torch
 import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
+from peft import LoraConfig, get_peft_model # LoRA libs
+import torch.nn as nn
 
 import utils
 
@@ -49,7 +51,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_path: str = field(default="data/code_alpaca_2k.json", metadata={"help": "Path to the training data."})
 
 
 @dataclass
@@ -179,6 +181,21 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -187,6 +204,31 @@ def train():
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
+
+    for param in model.parameters():
+        param.requires_grad = False
+        if param.ndim == 1:
+            param.data = param.data.to(torch.float32)
+
+    model.gradient_checkpointing_enable() 
+    model.enable_input_require_grads()
+
+    class CastOutputToFloat(nn.Sequential):
+        def forward(self, x): return super().forward(x).to(torch.float32)
+
+    model.lm_head = CastOutputToFloat(model.lm_head)
+
+    config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    model = get_peft_model(model, config)
+    print_trainable_parameters(model)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -201,14 +243,14 @@ def train():
             tokenizer=tokenizer,
             model=model,
         )
-    if "llama" in model_args.model_name_or_path:
-        tokenizer.add_special_tokens(
-            {
-                "eos_token": DEFAULT_EOS_TOKEN,
-                "bos_token": DEFAULT_BOS_TOKEN,
-                "unk_token": DEFAULT_UNK_TOKEN,
-            }
-        )
+    # if "llama" in model_args.model_name_or_path:
+    #     tokenizer.add_special_tokens(
+    #         {
+    #             "eos_token": DEFAULT_EOS_TOKEN,
+    #             "bos_token": DEFAULT_BOS_TOKEN,
+    #             "unk_token": DEFAULT_UNK_TOKEN,
+    #         }
+    #     )
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
